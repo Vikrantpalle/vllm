@@ -130,6 +130,16 @@ class Request:
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        if (
+            sampling_params is not None
+            and sampling_params.prompt_logprobs is not None
+            and sampling_params.prompt_logprobs_start_idx > self.num_prompt_tokens - 1
+        ):
+            raise ValueError(
+                "prompt_logprobs_start_idx must be less than or equal to "
+                f"num_prompt_tokens - 1 ({self.num_prompt_tokens - 1}), got "
+                f"{sampling_params.prompt_logprobs_start_idx}."
+            )
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()

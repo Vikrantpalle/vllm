@@ -628,6 +628,7 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        self.prompt_logprobs_start_idx: dict[str, int] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1127,6 +1128,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_logprobs_start_idx.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1232,6 +1234,9 @@ class GPUModelRunner(
                     self.input_batch.vocab_size
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
+                )
+                self.prompt_logprobs_start_idx[req_id] = (
+                    sampling_params.prompt_logprobs_start_idx
                 )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -5341,6 +5346,8 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int],
     ) -> dict[str, LogprobsTensors | None]:
         num_prompt_logprobs_dict = self.num_prompt_logprobs
+        prompt_logprobs_start_idx_dict = self.prompt_logprobs_start_idx
+
         if not num_prompt_logprobs_dict:
             return {}
 
@@ -5350,8 +5357,8 @@ class GPUModelRunner(
         # maintainable loop over optimal performance.
         completed_prefill_reqs = []
         for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
-            num_tokens = num_scheduled_tokens.get(req_id)
-            if num_tokens is None:
+            new_computed_tokens = num_scheduled_tokens.get(req_id)
+            if new_computed_tokens is None:
                 # This can happen if the request was preempted in prefill stage.
                 continue
 
@@ -5362,54 +5369,62 @@ class GPUModelRunner(
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
+
             prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
                 self.device, non_blocking=True
             )
+            logprob_start_idx = prompt_logprobs_start_idx_dict.get(req_id, 1)
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
             if logprobs_tensors is None:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
+                # num_positions = num_prompt_tokens - 1 - (logprob_start_idx - 1)
                 logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    num_prompt_tokens - logprob_start_idx, num_prompt_logprobs + 1
                 )
                 request.in_progress_prompt_logprobs_cpu = logprobs_tensors
 
-            # Determine number of logits to retrieve.
-            start_idx = request.num_computed_tokens
-            start_tok = start_idx + 1
-            num_remaining_tokens = num_prompt_tokens - start_tok
-            if num_tokens <= num_remaining_tokens:
-                # This is a chunk, more tokens remain.
-                # In the == case, there are no more prompt logprobs to produce
-                # but we want to defer returning them to the next step where we
-                # have new generated tokens to return.
-                num_logits = num_tokens
-            else:
-                # This is the last chunk of prompt tokens to return.
-                num_logits = num_remaining_tokens
+            # once prefill is completed no more processing to be done
+            # return log probs and cleanup
+            if request.num_computed_tokens >= num_prompt_tokens:
                 completed_prefill_reqs.append(req_id)
                 prompt_logprobs_dict[req_id] = logprobs_tensors
-
-            if num_logits <= 0:
-                # This can happen for the final chunk if we prefilled exactly
-                # (num_prompt_tokens - 1) tokens for this request in the prior
-                # step. There are no more prompt logprobs to produce.
                 continue
+
+            # log probability for sampled token at index i comes from index i-1 hidden
+            # state so shift [logprob_start_idx, num_prompt_tokens-1] left by 1
+            start_idx = logprob_start_idx - 1
+            end_idx = num_prompt_tokens - 2
+
+            # query tokens start and end indices for the newly computed tokens
+            q_start_idx = request.num_computed_tokens
+            q_end_idx = q_start_idx + new_computed_tokens - 1
+
+            if q_start_idx > end_idx or q_end_idx < start_idx:
+                continue
+
+            f_start_idx = max(start_idx, q_start_idx)
+            f_end_idx = min(end_idx, q_end_idx)
 
             # Get the logits corresponding to this req's prompt tokens.
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            prompt_hidden_states = hidden_states[
+                offset + f_start_idx - q_start_idx : offset
+                + f_end_idx
+                - q_start_idx
+                + 1
+            ]
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
             # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            tgt_token_ids = prompt_token_ids[f_start_idx + 1 : f_end_idx + 2]
 
             # Compute prompt logprobs.
             logprobs = self.sampler.compute_logprobs(logits)
@@ -5418,7 +5433,7 @@ class GPUModelRunner(
             )
 
             # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
+            chunk_slice = slice(f_start_idx - start_idx, f_end_idx - start_idx + 1)
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                 token_ids, non_blocking=True
             )
@@ -5432,6 +5447,7 @@ class GPUModelRunner(
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
             self.requests[req_id].in_progress_prompt_logprobs_cpu = None
+            del prompt_logprobs_start_idx_dict[req_id]
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:

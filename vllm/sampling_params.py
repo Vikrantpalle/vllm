@@ -244,6 +244,9 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprobs_start_idx: int = 1
+    """The starting token index from which log probabilities should be returned for 
+    the prompt, i.e, only return log probabilites for prompt_tokens[start_idx:]"""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -342,6 +345,7 @@ class SamplingParams(
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
+        prompt_logprobs_start_idx: int = 1,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -383,6 +387,7 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            prompt_logprobs_start_idx=prompt_logprobs_start_idx,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
@@ -528,6 +533,13 @@ class SamplingParams(
                 f"{self.prompt_logprobs}.",
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
+            )
+        if self.prompt_logprobs is not None and self.prompt_logprobs_start_idx < 1:
+            raise VLLMValidationError(
+                f"prompt_logprobs_start_idx must be >= 1, got "
+                f"{self.prompt_logprobs_start_idx}.",
+                parameter="prompt_logprobs_start_idx",
+                value=self.prompt_logprobs_start_idx,
             )
         assert isinstance(self.stop_token_ids, list)
         if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):
