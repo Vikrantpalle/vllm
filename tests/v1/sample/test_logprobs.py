@@ -20,6 +20,7 @@ from tests.v1.sample.utils import (
 from vllm import SamplingParams
 from vllm.config.model import LogprobsMode
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.exceptions import VLLMValidationError
 from vllm.platforms import current_platform
 
 from ...conftest import HfRunner, VllmRunner
@@ -395,6 +396,91 @@ def test_max_logprobs():
         bad_sampling_params = SamplingParams(logprobs=2)
         with pytest.raises(ValueError):
             runner.generate(["Hello world"], sampling_params=bad_sampling_params)
+
+
+def test_prompt_logprobs_start_idx_validation():
+    with pytest.raises(
+        VLLMValidationError, match="prompt_logprobs_start_idx must be >= 1"
+    ):
+        SamplingParams(prompt_logprobs=1, prompt_logprobs_start_idx=0)
+
+    prompt = "Hello world"
+
+    with VllmRunner(
+        "facebook/opt-125m",
+        max_logprobs=5,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.15,
+        max_model_len=256,
+    ) as runner:
+        prompt_token_ids = runner.llm.get_tokenizer().encode(prompt)
+        bad_sampling_params = SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            prompt_logprobs=1,
+            prompt_logprobs_start_idx=len(prompt_token_ids),
+        )
+        with pytest.raises(
+            ValueError,
+            match="prompt_logprobs_start_idx must be less than or equal to",
+        ):
+            runner.generate([prompt], sampling_params=bad_sampling_params)
+
+
+def test_prompt_logprobs_start_idx_suffix(vllm_model, example_prompts):
+    start_idx = 2
+    num_prompt_logprobs = 2
+    baseline_sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=3,
+        prompt_logprobs=num_prompt_logprobs,
+    )
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=3,
+        prompt_logprobs=num_prompt_logprobs,
+        prompt_logprobs_start_idx=start_idx,
+    )
+
+    baseline_outputs = vllm_model.generate_w_logprobs(
+        example_prompts,
+        sampling_params=baseline_sampling_params,
+        include_prompt_token_ids=True,
+    )
+    outputs = vllm_model.generate_w_logprobs(
+        example_prompts,
+        sampling_params=sampling_params,
+        include_prompt_token_ids=True,
+    )
+
+    for output, baseline_output in zip(outputs, baseline_outputs):
+        _, _, _, prompt_token_ids, prompt_logprobs = output
+        _, _, _, baseline_prompt_token_ids, baseline_prompt_logprobs = baseline_output
+        assert prompt_logprobs is not None
+        assert baseline_prompt_logprobs is not None
+        assert prompt_token_ids == baseline_prompt_token_ids
+        assert len(prompt_logprobs) == len(prompt_token_ids) - start_idx
+        for prompt_token_id, logprobs_dict, baseline_logprobs_dict in zip(
+            prompt_token_ids[start_idx:],
+            prompt_logprobs,
+            baseline_prompt_logprobs[start_idx:],
+        ):
+            assert logprobs_dict is not None
+            assert baseline_logprobs_dict is not None
+            assert prompt_token_id in logprobs_dict
+            assert logprobs_dict[prompt_token_id].rank >= 1
+            assert num_prompt_logprobs <= len(logprobs_dict) <= num_prompt_logprobs + 1
+            assert logprobs_dict.keys() == baseline_logprobs_dict.keys()
+            for token_id, logprob in logprobs_dict.items():
+                baseline_logprob = baseline_logprobs_dict[token_id]
+                assert logprob.rank == baseline_logprob.rank
+                assert logprob.decoded_token == baseline_logprob.decoded_token
+                torch.testing.assert_close(
+                    logprob.logprob,
+                    baseline_logprob.logprob,
+                    atol=2e-2,
+                    rtol=2e-2,
+                )
 
 
 def test_none_logprobs(vllm_model, example_prompts):
@@ -1230,4 +1316,102 @@ def test_prompt_logprobs_with_chunking_and_preemption():
         preemptions = preemptions_after - preemptions_before
         assert preemptions > 0, "Test did not trigger any preemptions"
 
-        print(f"Test passed with {preemptions} preemptions")
+
+def test_prompt_logprobs_start_idx_with_chunking_and_preemption():
+    """Test prompt_logprobs_start_idx with chunked prefill and preemption."""
+
+    prompts = [
+        "The following numbers of the sequence "
+        + ", ".join(str(i) for i in range(10))
+        + " are:",
+        "In one word, the capital of France is ",
+    ] + [f"Tell me about the number {i}: " for i in range(32)]
+
+    start_idx = 3
+    num_prompt_logprobs = 2
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=40,
+        min_tokens=20,
+        prompt_logprobs=num_prompt_logprobs,
+        prompt_logprobs_start_idx=start_idx,
+    )
+    baseline_sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=40,
+        min_tokens=20,
+        prompt_logprobs=num_prompt_logprobs,
+    )
+
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        max_model_len=512,
+        enable_chunked_prefill=True,
+        max_num_batched_tokens=48,
+        num_gpu_blocks_override=32,
+        disable_log_stats=False,
+        gpu_memory_utilization=0.25,
+    ) as vllm_model:
+        baseline_outputs = vllm_model.generate_w_logprobs(
+            prompts,
+            sampling_params=baseline_sampling_params,
+            include_prompt_token_ids=True,
+        )
+        metrics_after_baseline = vllm_model.llm.get_metrics()
+        outputs = vllm_model.generate_w_logprobs(
+            prompts, sampling_params=sampling_params, include_prompt_token_ids=True
+        )
+
+        for i, (output, baseline_output) in enumerate(zip(outputs, baseline_outputs)):
+            _, _, _, prompt_token_ids, prompt_logprobs = output
+            (
+                _,
+                _,
+                _,
+                baseline_prompt_token_ids,
+                baseline_prompt_logprobs,
+            ) = baseline_output
+            assert prompt_logprobs is not None and len(prompt_logprobs) > 0, (
+                f"Output {i} missing prompt logprobs"
+            )
+            assert baseline_prompt_logprobs is not None
+            assert prompt_token_ids == baseline_prompt_token_ids
+            assert len(prompt_logprobs) == len(prompt_token_ids) - start_idx
+            for prompt_token_id, logprobs_dict, baseline_logprobs_dict in zip(
+                prompt_token_ids[start_idx:],
+                prompt_logprobs,
+                baseline_prompt_logprobs[start_idx:],
+            ):
+                assert logprobs_dict is not None
+                assert baseline_logprobs_dict is not None
+                assert prompt_token_id in logprobs_dict
+                assert logprobs_dict[prompt_token_id].rank >= 1
+                assert (
+                    num_prompt_logprobs <= len(logprobs_dict) <= num_prompt_logprobs + 1
+                )
+                assert logprobs_dict.keys() == baseline_logprobs_dict.keys()
+                for token_id, logprob in logprobs_dict.items():
+                    baseline_logprob = baseline_logprobs_dict[token_id]
+                    assert logprob.rank == baseline_logprob.rank
+                    assert logprob.decoded_token == baseline_logprob.decoded_token
+                    torch.testing.assert_close(
+                        logprob.logprob,
+                        baseline_logprob.logprob,
+                        atol=2e-2,
+                        rtol=2e-2,
+                    )
+
+        metrics_after = vllm_model.llm.get_metrics()
+        preemptions_before = next(
+            (
+                m.value
+                for m in metrics_after_baseline
+                if m.name == "vllm:num_preemptions"
+            ),
+            0,
+        )
+        preemptions_after = next(
+            (m.value for m in metrics_after if m.name == "vllm:num_preemptions"), 0
+        )
+        preemptions = preemptions_after - preemptions_before
+        assert preemptions > 0, "Test did not trigger any preemptions"
