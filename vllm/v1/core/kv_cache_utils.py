@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+from pathlib import Path
+
 import copy
 import hashlib
 import math
@@ -2165,6 +2167,7 @@ def get_kv_cache_configs(
                 vllm_config, kv_cache_config
             )
 
+            Path("/tmp/vllm_kv_cache.json").write_text(str(num_tokens))
             logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
             logger.info_once(
                 "Maximum concurrency for %s tokens per request: %.2fx",

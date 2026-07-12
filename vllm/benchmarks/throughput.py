@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark offline inference throughput."""
 
+from pathlib import Path
+
+from dataclasses import replace
+
 import argparse
 import json
 import random
@@ -38,13 +42,20 @@ def run_vllm(
     from vllm import LLM
 
     llm = LLM.from_engine_args(engine_args)
+
+    path = Path("/tmp/vllm_kv_cache.json")
+    while not path.exists():
+        time.sleep(1)
+
+    kv_cache_tokens = int(path.read_text())
+
     req_tok_budget = sum(
         [request.prompt_len + request.expected_output_len for request in requests]
     )
-    if llm.llm_engine.model_config.max_model_len >= req_tok_budget:
+    if kv_cache_tokens > req_tok_budget:
         raise BatchTooLarge(
             f"Not enough space to store batch, required {req_tok_budget}",
-            " available {llm.llm_engine.model_config.max_model_len}",
+            f" available {kv_cache_tokens}",
         )
 
     if warmup_requests:
@@ -127,7 +138,7 @@ def _run_vllm_requests(
     return end - start, outputs
 
 
-def get_requests(args, tokenizer, num_prompts):
+def get_requests(args, tokenizer, num_prompts) -> list[SampleRequest]:
     requests = RandomDataset(random_seed=args.seed).sample(
         num_requests=num_prompts,
         input_len=args.input_len,
@@ -148,39 +159,8 @@ def validate_args(args):
             f"Num devices {num_devices} cannot be < max tp size {args.max_tp_size}"
         )
 
-    # === Deprecation and Defaulting ===
-    if args.dataset is not None:
-        warnings.warn(
-            "The '--dataset' argument will be deprecated in the next release. "
-            "Please use '--dataset-name' and '--dataset-path' instead.",
-            stacklevel=2,
-        )
-        args.dataset_path = args.dataset
-
     if not getattr(args, "tokenizer", None):
         args.tokenizer = args.model
-
-    # === Backend Validation ===
-    valid_backends = {"vllm"}
-    if args.backend not in valid_backends:
-        raise ValueError(f"Unsupported backend: {args.backend}")
-    if args.prequeue_requests and args.backend not in {"vllm", "vllm-chat"}:
-        raise ValueError("--prequeue-requests requires --backend vllm or vllm-chat")
-    if args.prequeue_requests and args.async_engine:
-        raise ValueError("--prequeue-requests is not supported with --async-engine")
-
-    if args.data_parallel_size > 1 and (
-        args.distributed_executor_backend != "external_launcher" or args.async_engine
-    ):
-        # --data-parallel is not supported fully.
-        # Old issue: https://github.com/vllm-project/vllm/issues/16222
-        # Currently we only support data parallel with external launcher
-        # mode (i.e., launch with toruchrun).
-        raise ValueError(
-            "Data parallel is only supported with external launcher mode "
-            "with synchronous engine in offline benchmark, "
-            "please use benchmark serving instead"
-        )
 
 
 def add_cli_args(parser: FlexibleArgumentParser):
@@ -190,6 +170,8 @@ def add_cli_args(parser: FlexibleArgumentParser):
         choices=["vllm"],
         default="vllm",
     )
+
+    parser.add_argument("--tp-size", type=int, default=None)
 
     parser.add_argument(
         "--max-tp-size", type=int, default=None, help="Sweep TP from 1,2,4..max-tp-size"
@@ -278,32 +260,36 @@ def main(args: argparse.Namespace):
         trust_remote_code=args.trust_remote_code,
     )
 
-    max_tp_size = args.max_tp_size
-    max_bs = args.max_batch_size
-    tp_size = 1
+    max_tp_size = args.tp_size if args.tp_size else args.max_tp_size
+    eff_max_bs = args.max_tp_size * args.max_batch_size
+    tp_size = args.tp_size if args.tp_size else 1
 
-    requests = get_requests(args, tokenizer, max_bs)
+    requests = get_requests(args, tokenizer, eff_max_bs)
 
     results = []
 
     while tp_size <= max_tp_size:
         bs = 1
-        while bs <= max_bs:
+        while bs <= eff_max_bs:
             try:
                 engine_args = EngineArgs.from_cli_args(args)
                 engine_args.tensor_parallel_size = tp_size
                 engine_args.pipeline_parallel_size = 1
                 engine_args.data_parallel_size = 1
 
-                engine_args.device_ids = range(tp_size)
+                engine_args.device_ids = list(range(tp_size))
+
+                warmup_reqs = [replace(req) for req in requests]
+                for req in warmup_reqs:
+                    req.expected_output_len = 1
 
                 elapsed_time, request_outputs = run_vllm(
                     requests[:bs],
-                    args.n,
+                    1,
                     engine_args,
                     disable_detokenize=args.disable_detokenize,
                     do_profile=args.profile,
-                    warmup_requests=requests,
+                    warmup_requests=warmup_reqs[:bs],
                     prequeue_requests=args.prequeue_requests,
                 )
 

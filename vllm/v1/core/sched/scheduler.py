@@ -725,6 +725,10 @@ class Scheduler(SchedulerInterface):
                             self.kv_cache_manager.get_computed_blocks(request)
                         )
 
+                        print(
+                            f"kv cache prefill hit {num_new_local_computed_tokens}/{request.num_tokens}"
+                        )
+
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
                     if self.has_mamba_layers:
                         num_uncached_common_prefix_tokens = getattr(
