@@ -2,16 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark offline inference throughput."""
 
-from datetime import datetime
-
-from pathlib import Path
-
-from dataclasses import replace
-
 import argparse
 import json
 import random
 import time
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,7 +31,6 @@ def run_vllm(
     do_profile: bool,
     disable_detokenize: bool = False,
     warmup_requests: list[SampleRequest] | None = None,
-    prequeue_requests: bool = False,
 ) -> tuple[float, list[RequestOutput] | None]:
 
     if warmup_requests:
@@ -45,7 +41,6 @@ def run_vllm(
             n,
             disable_detokenize,
             do_profile=False,
-            prequeue_requests=prequeue_requests,
         )
 
     return _run_vllm_requests(
@@ -54,7 +49,6 @@ def run_vllm(
         n,
         disable_detokenize,
         do_profile=do_profile,
-        prequeue_requests=prequeue_requests,
     )
 
 
@@ -64,7 +58,6 @@ def _run_vllm_requests(
     n: int,
     disable_detokenize: bool,
     do_profile: bool,
-    prequeue_requests: bool,
 ) -> tuple[float, list[RequestOutput] | None]:
     from vllm import SamplingParams
 
@@ -101,11 +94,13 @@ def _run_vllm_requests(
     return end - start, outputs
 
 
-def get_requests(args, tokenizer, num_prompts) -> list[SampleRequest]:
-    requests = RandomDataset(random_seed=args.seed).sample(
+def get_requests(
+    input_len, output_len, seed, tokenizer, num_prompts
+) -> list[SampleRequest]:
+    requests = RandomDataset(random_seed=seed).sample(
         num_requests=num_prompts,
-        input_len=args.input_len,
-        output_len=args.output_len,
+        input_len=input_len,
+        output_len=output_len,
         tokenizer=tokenizer,
     )
     return requests
@@ -149,9 +144,6 @@ def add_cli_args(parser: FlexibleArgumentParser):
         help="Output length for each request. Overrides the "
         "output length from the dataset.",
     )
-    parser.add_argument(
-        "--num-prompts", type=int, default=1000, help="Number of prompts to process."
-    )
 
     parser.add_argument(
         "--disable-detokenize",
@@ -187,6 +179,8 @@ def init_llm(engine_args, tp_size: int):
 
     llm = LLM.from_engine_args(engine_args)
 
+    llm.reset_prefix_cache()
+
     while not path.exists():
         time.sleep(1)
 
@@ -210,8 +204,6 @@ def main(args: argparse.Namespace):
     eff_max_bs = args.max_eff_batch_size
     tp_size = args.tp_size
 
-    requests = get_requests(args, tokenizer, eff_max_bs)
-
     results = []
 
     engine_args = EngineArgs.from_cli_args(args)
@@ -227,6 +219,11 @@ def main(args: argparse.Namespace):
         for output_len in OUTPUT_LENS:
             if output_len > args.max_output_len:
                 break
+
+            requests = get_requests(
+                input_len + 1, output_len, args.seed, tokenizer, eff_max_bs
+            )
+
             bs = 1
             while bs * (args.node_size // tp_size) <= eff_max_bs:
                 common_args = {
@@ -236,7 +233,7 @@ def main(args: argparse.Namespace):
                     "batch_size": bs,
                 }
 
-                if bs * (input_len + output_len) > max_tokens:
+                if bs * (input_len + output_len + 1) > max_tokens:
                     results.append(
                         {
                             "elapsed_time": None,
@@ -244,7 +241,7 @@ def main(args: argparse.Namespace):
                             **common_args,
                         }
                     )
-                    continue
+                    break
 
                 warmup_reqs = [replace(req) for req in requests]
                 for req in warmup_reqs:
@@ -257,8 +254,9 @@ def main(args: argparse.Namespace):
                     disable_detokenize=args.disable_detokenize,
                     do_profile=args.profile,
                     warmup_requests=warmup_reqs[:bs],
-                    prequeue_requests=args.prequeue_requests,
                 )
+
+                llm.reset_prefix_cache()
 
                 total_prompt_tokens = 0
                 total_output_tokens = 0
