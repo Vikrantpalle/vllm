@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark offline inference throughput."""
 
+from datetime import datetime
+
 from pathlib import Path
 
 from dataclasses import replace
@@ -10,7 +12,6 @@ import argparse
 import json
 import random
 import time
-import warnings
 from typing import Any
 
 import torch
@@ -26,37 +27,15 @@ from vllm.tokenizers import get_tokenizer
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
-class BatchTooLarge(Exception):
-    pass
-
-
 def run_vllm(
     requests: list[SampleRequest],
     n: int,
-    engine_args: EngineArgs,
+    llm,
     do_profile: bool,
     disable_detokenize: bool = False,
     warmup_requests: list[SampleRequest] | None = None,
     prequeue_requests: bool = False,
 ) -> tuple[float, list[RequestOutput] | None]:
-    from vllm import LLM
-
-    llm = LLM.from_engine_args(engine_args)
-
-    path = Path("/tmp/vllm_kv_cache.json")
-    while not path.exists():
-        time.sleep(1)
-
-    kv_cache_tokens = int(path.read_text())
-
-    req_tok_budget = sum(
-        [request.prompt_len + request.expected_output_len for request in requests]
-    )
-    if kv_cache_tokens > req_tok_budget:
-        raise BatchTooLarge(
-            f"Not enough space to store batch, required {req_tok_budget}",
-            f" available {kv_cache_tokens}",
-        )
 
     if warmup_requests:
         print(f"Warming up with {len(warmup_requests)} requests...")
@@ -112,26 +91,10 @@ def _run_vllm_requests(
             )
         )
 
-    if prequeue_requests:
-        llm.sleep(level=0, mode="abort")
-
     start = time.perf_counter()
     if do_profile:
         llm.start_profile()
-
-    if prequeue_requests:
-        try:
-            llm.enqueue(
-                prompts,
-                sampling_params,
-                use_tqdm=True,
-            )
-        finally:
-            llm.wake_up(tags=["scheduling"])
-        outputs = llm.wait_for_completion(output_type=RequestOutput, use_tqdm=True)
-    else:
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
-
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
     if do_profile:
         llm.stop_profile()
     end = time.perf_counter()
@@ -154,51 +117,33 @@ def validate_args(args):
     """
 
     num_devices = torch.cuda.device_count()
-    if num_devices < args.max_tp_size:
-        raise ValueError(
-            f"Num devices {num_devices} cannot be < max tp size {args.max_tp_size}"
-        )
+    if num_devices < args.tp_size:
+        raise ValueError(f"Not enough devices {num_devices} for tp size {args.tp_size}")
 
     if not getattr(args, "tokenizer", None):
         args.tokenizer = args.model
 
 
 def add_cli_args(parser: FlexibleArgumentParser):
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["vllm"],
-        default="vllm",
-    )
-
     parser.add_argument("--tp-size", type=int, default=None)
 
-    parser.add_argument(
-        "--max-tp-size", type=int, default=None, help="Sweep TP from 1,2,4..max-tp-size"
-    )
+    parser.add_argument("--node-size", type=int, default=None)
 
     parser.add_argument(
-        "--max-batch-size",
+        "--max-eff-batch-size",
         type=int,
         default=None,
         help="Sweep batch size from 1,2,4..max-batch-size",
     )
 
     parser.add_argument(
-        "--dataset-name",
-        type=str,
-        choices=["random"],
-        help="Name of the dataset to benchmark on.",
-        default="random",
-    )
-    parser.add_argument(
-        "--input-len",
+        "--max-input-len",
         type=int,
         default=None,
         help="Input prompt length for each request",
     )
     parser.add_argument(
-        "--output-len",
+        "--max-output-len",
         type=int,
         default=None,
         help="Output length for each request. Overrides the "
@@ -208,27 +153,6 @@ def add_cli_args(parser: FlexibleArgumentParser):
         "--num-prompts", type=int, default=1000, help="Number of prompts to process."
     )
 
-    parser.add_argument(
-        "--output-json",
-        type=str,
-        default=None,
-        help="Path to save the throughput results in JSON format.",
-    )
-
-    parser.add_argument(
-        "--prequeue-requests",
-        action="store_true",
-        default=False,
-        help=(
-            "For the vLLM backends, enqueue all requests before allowing the "
-            "scheduler to process them. This can improve benchmark "
-            "reproducibility by removing overlap between request rendering "
-            "and engine scheduling, but may reduce measured throughput. "
-            "Request rendering is typically fast relative to scheduling and "
-            "processing; the intended use case of this flag is multimodal "
-            "benchmarks with time-consuming image rendering."
-        ),
-    )
     parser.add_argument(
         "--disable-detokenize",
         action="store_true",
@@ -248,6 +172,29 @@ def add_cli_args(parser: FlexibleArgumentParser):
     parser = AsyncEngineArgs.add_cli_args(parser)
 
 
+def init_llm(engine_args, tp_size: int):
+
+    engine_args.tensor_parallel_size = tp_size
+    engine_args.pipeline_parallel_size = 1
+    engine_args.data_parallel_size = 1
+
+    engine_args.device_ids = list(range(tp_size))
+
+    from vllm import LLM
+
+    path = Path("/tmp/vllm_kv_cache.json")
+    path.unlink(True)
+
+    llm = LLM.from_engine_args(engine_args)
+
+    while not path.exists():
+        time.sleep(1)
+
+    kv_cache_tokens = int(path.read_text())
+
+    return llm, kv_cache_tokens
+
+
 def main(args: argparse.Namespace):
     validate_args(args)
     if args.seed is None:
@@ -260,24 +207,44 @@ def main(args: argparse.Namespace):
         trust_remote_code=args.trust_remote_code,
     )
 
-    max_tp_size = args.tp_size if args.tp_size else args.max_tp_size
-    eff_max_bs = args.max_tp_size * args.max_batch_size
-    tp_size = args.tp_size if args.tp_size else 1
+    eff_max_bs = args.max_eff_batch_size
+    tp_size = args.tp_size
 
     requests = get_requests(args, tokenizer, eff_max_bs)
 
     results = []
 
-    while tp_size <= max_tp_size:
-        bs = 1
-        while bs <= eff_max_bs:
-            try:
-                engine_args = EngineArgs.from_cli_args(args)
-                engine_args.tensor_parallel_size = tp_size
-                engine_args.pipeline_parallel_size = 1
-                engine_args.data_parallel_size = 1
+    engine_args = EngineArgs.from_cli_args(args)
 
-                engine_args.device_ids = list(range(tp_size))
+    llm, max_tokens = init_llm(engine_args, tp_size)
+
+    CONTEXT_LENS = [512, 2048, 8192, 32768]
+    OUTPUT_LENS = [128, 512, 1024]
+
+    for input_len in CONTEXT_LENS:
+        if input_len > args.max_input_len:
+            break
+        for output_len in OUTPUT_LENS:
+            if output_len > args.max_output_len:
+                break
+            bs = 1
+            while bs * (args.node_size // tp_size) <= eff_max_bs:
+                common_args = {
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "tp_size": tp_size,
+                    "batch_size": bs,
+                }
+
+                if bs * (input_len + output_len) > max_tokens:
+                    results.append(
+                        {
+                            "elapsed_time": None,
+                            "reason": "batch too large",
+                            **common_args,
+                        }
+                    )
+                    continue
 
                 warmup_reqs = [replace(req) for req in requests]
                 for req in warmup_reqs:
@@ -286,7 +253,7 @@ def main(args: argparse.Namespace):
                 elapsed_time, request_outputs = run_vllm(
                     requests[:bs],
                     1,
-                    engine_args,
+                    llm,
                     disable_detokenize=args.disable_detokenize,
                     do_profile=args.profile,
                     warmup_requests=warmup_reqs[:bs],
@@ -317,32 +284,11 @@ def main(args: argparse.Namespace):
                 print(f"Total num prompt tokens:  {total_prompt_tokens}")
                 print(f"Total num output tokens:  {total_output_tokens}")
 
-                results.append(
-                    {
-                        "elapsed_time": elapsed_time,
-                        "num_requests": len(requests),
-                        "batch_size": bs,
-                        "tp_size": tp_size,
-                        "input_len": args.input_len,
-                        "output_len": args.output_len,
-                    }
-                )
-            except BatchTooLarge as e:
-                results.append(
-                    {
-                        "elapsed_time": None,
-                        "num_requests": len(requests),
-                        "batch_size": bs,
-                        "tp_size": tp_size,
-                        "input_len": args.input_len,
-                        "output_len": args.output_len,
-                        "reason": str(e),
-                    }
-                )
+                results.append({"elapsed_time": elapsed_time, **common_args})
 
-            bs *= 2
-        tp_size *= 2
+                bs *= 2
 
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            json.dump(results, f, indent=4)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    out_file = f"results/{args.model}_ns{args.node_size}_tp{tp_size}_{timestamp}.json"
+    with open(out_file, "w") as f:
+        json.dump(results, f, indent=4)
