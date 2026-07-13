@@ -287,6 +287,6 @@ def main(args: argparse.Namespace):
                 bs *= 2
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    out_file = f"results/{args.model}_ns{args.node_size}_tp{tp_size}_{timestamp}.json"
+    out_file = f"results/{args.model.split('/')[-1]}_ns{args.node_size}_tp{tp_size}_{timestamp}.json"
     with open(out_file, "w") as f:
         json.dump(results, f, indent=4)
