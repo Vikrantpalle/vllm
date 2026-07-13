@@ -216,13 +216,15 @@ def main(args: argparse.Namespace):
     for input_len in CONTEXT_LENS:
         if input_len > args.max_input_len:
             break
+
+        requests = get_requests(input_len + 1, 1, args.seed, tokenizer, eff_max_bs)
+
         for output_len in OUTPUT_LENS:
             if output_len > args.max_output_len:
                 break
 
-            requests = get_requests(
-                input_len + 1, output_len, args.seed, tokenizer, eff_max_bs
-            )
+            for req in requests:
+                req.expected_output_len = output_len
 
             bs = 1
             while bs * (args.node_size // tp_size) <= eff_max_bs:
